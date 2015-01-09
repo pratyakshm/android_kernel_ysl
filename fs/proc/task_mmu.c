@@ -17,7 +17,6 @@
 #include <linux/shmem_fs.h>
 #include <linux/mm_inline.h>
 #include <linux/ctype.h>
-
 #include <asm/elf.h>
 #include <asm/uaccess.h>
 #include <asm/tlbflush.h>
@@ -1630,24 +1629,26 @@ const struct file_operations proc_pagemap_operations = {
 };
 #endif /* CONFIG_PROC_PAGE_MONITOR */
 
+
 #ifdef CONFIG_PROCESS_RECLAIM
-static int reclaim_pte_range(pmd_t *pmd, unsigned long addr,
+enum reclaim_type {
+	RECLAIM_FILE,
+	RECLAIM_ANON,
+	RECLAIM_ALL,
+};
+
+static int reclaim_pmd_range(pmd_t *pmd, unsigned long addr,
 				unsigned long end, struct mm_walk *walk)
 {
-	struct vm_area_struct *vma = walk->private;
-	pte_t *pte, ptent;
+	pte_t *orig_pte, *pte, ptent;
 	spinlock_t *ptl;
-	struct page *page;
 	LIST_HEAD(page_list);
-	int isolated;
+	struct page *page;
+	int isolated = 0;
+	struct vm_area_struct *vma = walk->vma;
 
-	split_huge_pmd(vma, addr, pmd);
-	if (pmd_trans_unstable(pmd))
-		return 0;
-cont:
-	isolated = 0;
-	pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
-	for (; addr != end; pte++, addr += PAGE_SIZE) {
+	orig_pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
+	for (pte = orig_pte; addr < end; pte++, addr += PAGE_SIZE) {
 		ptent = *pte;
 		if (!pte_present(ptent))
 			continue;
@@ -1655,45 +1656,58 @@ cont:
 		page = vm_normal_page(vma, addr, ptent);
 		if (!page)
 			continue;
+		/*
+		 * XXX: we don't handle compound page at this moment but
+		 * it should revisit for THP page before upstream.
+		 */
+		if (PageCompound(page)) {
+			unsigned int order = compound_order(page);
+			unsigned int nr_pages = (1 << order) - 1;
+
+			addr += (nr_pages * PAGE_SIZE);
+			pte += nr_pages;
+			continue;
+		}
+
+		if (!PageLRU(page))
+			continue;
+
+		if (page_mapcount(page) > 1)
+			continue;
 
 		if (isolate_lru_page(page))
 			continue;
 
-		list_add(&page->lru, &page_list);
-		inc_node_page_state(page, NR_ISOLATED_ANON +
-				page_is_file_cache(page));
 		isolated++;
-		if (isolated >= SWAP_CLUSTER_MAX)
-			break;
+		list_add(&page->lru, &page_list);
+		if (isolated >= SWAP_CLUSTER_MAX) {
+			pte_unmap_unlock(orig_pte, ptl);
+			reclaim_pages(&page_list);
+			isolated = 0;
+			pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
+			orig_pte = pte;
+		}
 	}
-	pte_unmap_unlock(pte - 1, ptl);
-	reclaim_pages_from_list(&page_list, vma);
-	if (addr != end)
-		goto cont;
+
+	pte_unmap_unlock(orig_pte, ptl);
+	reclaim_pages(&page_list);
 
 	cond_resched();
 	return 0;
 }
 
-enum reclaim_type {
-	RECLAIM_FILE,
-	RECLAIM_ANON,
-	RECLAIM_ALL,
-	RECLAIM_RANGE,
-};
-
 static ssize_t reclaim_write(struct file *file, const char __user *buf,
 				size_t count, loff_t *ppos)
 {
 	struct task_struct *task;
-	char buffer[200];
+	char buffer[PROC_NUMBUF];
 	struct mm_struct *mm;
 	struct vm_area_struct *vma;
 	enum reclaim_type type;
 	char *type_buf;
-	struct mm_walk reclaim_walk = {};
-	unsigned long start = 0;
-	unsigned long end = 0;
+
+	if (!capable(CAP_SYS_NICE))
+		return -EPERM;
 
 	memset(buffer, 0, sizeof(buffer));
 	if (count > sizeof(buffer) - 1)
@@ -1709,93 +1723,43 @@ static ssize_t reclaim_write(struct file *file, const char __user *buf,
 		type = RECLAIM_ANON;
 	else if (!strcmp(type_buf, "all"))
 		type = RECLAIM_ALL;
-	else if (isdigit(*type_buf))
-		type = RECLAIM_RANGE;
 	else
-		goto out_err;
-
-	if (type == RECLAIM_RANGE) {
-		char *token;
-		unsigned long long len, len_in, tmp;
-		token = strsep(&type_buf, " ");
-		if (!token)
-			goto out_err;
-		tmp = memparse(token, &token);
-		if (tmp & ~PAGE_MASK || tmp > ULONG_MAX)
-			goto out_err;
-		start = tmp;
-
-		token = strsep(&type_buf, " ");
-		if (!token)
-			goto out_err;
-		len_in = memparse(token, &token);
-		len = (len_in + ~PAGE_MASK) & PAGE_MASK;
-		if (len > ULONG_MAX)
-			goto out_err;
-		/*
-		 * Check to see whether len was rounded up from small -ve
-		 * to zero.
-		 */
-		if (len_in && !len)
-			goto out_err;
-
-		end = start + len;
-		if (end < start)
-			goto out_err;
-	}
+		return -EINVAL;
 
 	task = get_proc_task(file->f_path.dentry->d_inode);
 	if (!task)
 		return -ESRCH;
 
 	mm = get_task_mm(task);
-	if (!mm)
-		goto out;
+	if (mm) {
+		struct mm_walk reclaim_walk = {
+			.pmd_entry = reclaim_pmd_range,
+			.mm = mm,
+		};
 
-	reclaim_walk.mm = mm;
-	reclaim_walk.pmd_entry = reclaim_pte_range;
-
-	down_read(&mm->mmap_sem);
-	if (type == RECLAIM_RANGE) {
-		vma = find_vma(mm, start);
-		while (vma) {
-			if (vma->vm_start > end)
-				break;
-			if (is_vm_hugetlb_page(vma))
-				continue;
-
-			reclaim_walk.private = vma;
-			walk_page_range(max(vma->vm_start, start),
-					min(vma->vm_end, end),
-					&reclaim_walk);
-			vma = vma->vm_next;
-		}
-	} else {
+		down_read(&mm->mmap_sem);
 		for (vma = mm->mmap; vma; vma = vma->vm_next) {
 			if (is_vm_hugetlb_page(vma))
 				continue;
 
-			if (type == RECLAIM_ANON && vma->vm_file)
+			if (vma->vm_flags & VM_LOCKED)
 				continue;
 
-			if (type == RECLAIM_FILE && !vma->vm_file)
+			if (type == RECLAIM_ANON && !vma_is_anonymous(vma))
+				continue;
+			if (type == RECLAIM_FILE && vma_is_anonymous(vma))
 				continue;
 
-			reclaim_walk.private = vma;
 			walk_page_range(vma->vm_start, vma->vm_end,
-				&reclaim_walk);
+					&reclaim_walk);
 		}
+		flush_tlb_mm(mm);
+		up_read(&mm->mmap_sem);
+		mmput(mm);
 	}
-
-	flush_tlb_mm(mm);
-	up_read(&mm->mmap_sem);
-	mmput(mm);
-out:
 	put_task_struct(task);
-	return count;
 
-out_err:
-	return -EINVAL;
+	return count;
 }
 
 const struct file_operations proc_reclaim_operations = {
@@ -1803,6 +1767,7 @@ const struct file_operations proc_reclaim_operations = {
 	.llseek		= noop_llseek,
 };
 #endif
+
 
 #ifdef CONFIG_NUMA
 
